@@ -2,12 +2,13 @@ import streamlit as st
 import pandas as pd
 import random
 import re
+from datetime import datetime, timedelta, time
 from collections import defaultdict
 from streamlit_gsheets import GSheetsConnection
 
 # --- 設定 ---
 st.set_page_config(page_title="レッスン調整システム", layout="wide")
-st.title("🎹 レッスン日程 自動調整システム v3")
+st.title("🎹 レッスン日程 自動調整システム v4")
 
 conn = st.connection("gsheets", type=GSheetsConnection)
 
@@ -96,7 +97,7 @@ with tab1:
                     st.rerun()
 
 # ----------------------------------------
-# タブ2: 先生用 (機能追加版)
+# タブ2: 先生用 (v4: 連続枠生成機能付き)
 # ----------------------------------------
 with tab2:
     st.header("管理者メニュー")
@@ -116,28 +117,62 @@ with tab2:
             st.success("保存しました！")
             st.rerun()
 
-    # --- 右カラム: 自動生成ツール ---
+    # --- 右カラム: 自動生成ツール (改良版) ---
     with col_tool:
-        st.info("💡 **一括追加ツール**\n\n日付と時間を選ぶと、自動で「50分枠」を作ってリストに追加します。")
+        st.info("💡 **一括追加ツール (改)**\n\n50分レッスンを**間隔を空けずに連続して**作成します。\n(例: 10:00-10:50, 10:50-11:40...)")
+        
         with st.form("generator"):
-            gen_date = st.text_input("日付 (例: 10/4(土))")
-            start_hour = st.number_input("開始時", 9, 21, 10)
-            end_hour = st.number_input("終了時 (この時間まで作成)", 10, 22, 18)
+            gen_date_str = st.text_input("日付 (例: 10/4(土))", value="10/4(土)")
+            
+            # 10分刻みの時間リストを作成 (8:00〜22:00)
+            time_options = []
+            for h in range(8, 23):
+                for m in range(0, 60, 10):
+                    time_options.append(time(h, m))
+            
+            # デフォルト値の設定 (10:00開始, 18:00終了)
+            def_start = time(10, 0)
+            def_end = time(18, 0)
+            try:
+                idx_start = time_options.index(def_start)
+                idx_end = time_options.index(def_end)
+            except:
+                idx_start, idx_end = 0, len(time_options)-1
+
+            col_t1, col_t2 = st.columns(2)
+            start_t = col_t1.selectbox("開始時間", time_options, index=idx_start, format_func=lambda t: t.strftime("%H:%M"))
+            end_t = col_t2.selectbox("終了時間 (この時間まで)", time_options, index=idx_end, format_func=lambda t: t.strftime("%H:%M"))
             
             if st.form_submit_button("この条件で枠を追加"):
                 added_slots = []
-                # 開始時から終了時までループ
-                for h in range(start_hour, end_hour):
-                    # 50分枠を作成 (例: 10:00-10:50)
-                    slot_str = f"{gen_date} {h}:00-{h}:50"
-                    added_slots.append(slot_str)
                 
-                # 既存リストに追加
-                current_list = [line.strip() for line in new_text.split('\n') if line.strip()]
-                updated_list = current_list + added_slots
-                save_slots(updated_list)
-                st.success(f"{len(added_slots)}個の枠を追加しました！左のリストを確認して「更新して保存」は不要です(自動保存済)。")
-                st.rerun()
+                # 計算用にdatetimeオブジェクト化 (日付部分はダミー)
+                dummy_date = datetime(2000, 1, 1)
+                curr_dt = datetime.combine(dummy_date, start_t)
+                limit_dt = datetime.combine(dummy_date, end_t)
+                
+                # 終了時間を超えない限りループ
+                while curr_dt + timedelta(minutes=50) <= limit_dt:
+                    next_dt = curr_dt + timedelta(minutes=50)
+                    
+                    s_str = curr_dt.strftime("%H:%M")
+                    e_str = next_dt.strftime("%H:%M")
+                    
+                    slot_str = f"{gen_date_str} {s_str}-{e_str}"
+                    added_slots.append(slot_str)
+                    
+                    # 休憩なしなので、次は「今の終了時間」からスタート
+                    curr_dt = next_dt
+                
+                # 保存処理
+                if added_slots:
+                    current_list = [line.strip() for line in new_text.split('\n') if line.strip()]
+                    updated_list = current_list + added_slots
+                    save_slots(updated_list)
+                    st.success(f"{len(added_slots)}個の枠を追加しました！")
+                    st.rerun()
+                else:
+                    st.warning("枠が作成されませんでした。終了時間を開始時間より遅くしてください。")
 
     st.markdown("---")
     st.subheader("シフト自動作成")
@@ -170,47 +205,4 @@ with tab2:
             
             for slot in sorted_slots:
                 cands = slot_applicants[slot]
-                if not cands: continue
-                
-                # 日付判定 (スペース区切りの1つ目)
-                date_part = slot.split(" ")[0]
-                valid = [c for c in cands if daily_counts[c][date_part] < 2]
-                
-                if valid:
-                    valid.sort(key=lambda x: (student_counts[x], random.random()))
-                    winner = valid[0]
-                    final_schedule[slot] = winner
-                    student_counts[winner] += 1
-                    daily_counts[winner][date_part] += 1
-            
-            st.success("シフト案を作成しました。")
-            res_list = []
-            for slot in current_slots:
-                winner = final_schedule.get(slot, None)
-                if winner:
-                    res_list.append({"日時": slot, "受講者": winner, "学期": get_semester(slot)})
-            
-            if res_list:
-                st.session_state["preview_schedule"] = pd.DataFrame(res_list)
-                st.table(st.session_state["preview_schedule"])
-            else: st.warning("マッチング成立数: 0")
-
-    if "preview_schedule" in st.session_state:
-        if st.button("このシフトで確定し、履歴に保存する"):
-            save_history(st.session_state["preview_schedule"])
-            st.success("履歴に保存しました！")
-            del st.session_state["preview_schedule"]
-
-# ----------------------------------------
-# タブ3: 集計
-# ----------------------------------------
-with tab3:
-    st.header("レッスン回数集計")
-    df_hist = load_history()
-    if df_hist.empty: st.info("履歴なし")
-    else:
-        try:
-            pivot = pd.crosstab(df_hist["受講者"], df_hist["学期"], margins=True, margins_name="合計")
-            st.dataframe(pivot)
-            st.write("詳細履歴", df_hist)
-        except: st.error("集計エラー")
+                if not
