@@ -9,14 +9,14 @@ from streamlit_gsheets import GSheetsConnection
 
 # --- 設定 ---
 st.set_page_config(page_title="レッスン調整システム", page_icon="🎹", layout="wide")
-st.title("🎹 レッスン日程 自動調整システム v13")
+st.title("🎹 レッスン日程 自動調整システム v14")
 
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 # --- 関数群 ---
 
 def normalize_date_text(text):
-    # 日付(M/D)を "M月D日(曜日)" に変換する
+    # 日付(M/D)を "M月D日(曜日)" に変換
     text = unicodedata.normalize('NFKC', text)
     date_match = re.search(r'(\d{1,2})[\/\-月\.](\d{1,2})', text)
     if not date_match: return text
@@ -30,10 +30,15 @@ def normalize_date_text(text):
     
     weekdays = ["月", "火", "水", "木", "金", "土", "日"]
     wk = weekdays[dt.weekday()]
-    return f"{month}月{day}日({wk})"
+    
+    # 時間部分があればそのまま返す、なければ日付だけ
+    base_date = f"{month}月{day}日({wk})"
+    time_match = re.search(r'(\d{1,2}:\d{2}.*)', text)
+    if time_match:
+        return f"{base_date} {time_match.group(1)}"
+    return base_date
 
 def get_semester(date_str):
-    # 学期判定 (4-8月:前期, 9-3月:後期)
     match = re.search(r'(\d{1,2})月', date_str)
     if match:
         month = int(match.group(1))
@@ -42,7 +47,6 @@ def get_semester(date_str):
     return "不明"
 
 def sort_slots(slot_list):
-    # 日付順・時間順に並べ替え
     def parse_key(s):
         try:
             match = re.search(r'(\d{1,2})月(\d{1,2})日.*?(\d{1,2}):(\d{2})', s)
@@ -138,7 +142,6 @@ with tab1:
             # 日付グループ化
             slots_by_date = defaultdict(list)
             for slot in current_slots:
-                # "9月11日(木)" の部分をキーにする
                 d_key = slot.split(" ")[0]
                 slots_by_date[d_key].append(slot)
 
@@ -146,16 +149,12 @@ with tab1:
                 final_selected = []
                 for d_key, slots in slots_by_date.items():
                     with st.expander(f"📅 {d_key}", expanded=True):
-                        # 全選択オプション
                         all_checked = all(s in existing_wishes for s in slots)
                         if st.checkbox(f"🙆‍♂️ {d_key} は何時でもOK", value=all_checked, key=f"all_{d_key}"):
-                            # 全選択ならこの日の全スロットを追加
                             final_selected.extend(slots)
                         else:
-                            # 個別選択
                             cols = st.columns(2)
                             for i, slot in enumerate(slots):
-                                # 時間部分のみ表示 "10:00-10:50"
                                 label = slot.replace(d_key, "").strip()
                                 is_on = slot in existing_wishes
                                 if cols[i % 2].checkbox(label, value=is_on, key=f"chk_{slot}"):
@@ -163,7 +162,6 @@ with tab1:
                 
                 st.markdown("---")
                 if st.form_submit_button("希望を送信する", type="primary"):
-                    # 重複除去して保存
                     final_selected = sorted(list(set(final_selected)), key=lambda s: current_slots.index(s) if s in current_slots else 999)
                     wishes_str = ",".join(final_selected)
                     new_row = {"氏名": student_name, "希望枠": wishes_str}
@@ -180,11 +178,10 @@ with tab1:
 with tab2:
     st.header("管理者メニュー")
     
-    # 1. レッスン回数カウンター (NEW!)
+    # 1. レッスン回数カウンター
     with st.expander("📊 半期ごとのレッスン回数を確認", expanded=False):
         df_h = load_history()
         if not df_h.empty:
-            # ピボットテーブルで見やすく
             count_table = pd.crosstab(df_h["受講者"], df_h["学期"], margins=True, margins_name="合計")
             st.dataframe(count_table, use_container_width=True)
         else:
@@ -192,42 +189,76 @@ with tab2:
 
     st.markdown("---")
     
-    # 2. 1件ずつ確実に追加
-    st.subheader("➕ レッスン枠の追加")
-    st.caption("日付と開始時間を入力してください。自動で **50分枠** として登録されます。")
+    # 2. 自動生成ツール (復活版)
+    st.subheader("🪄 日程の一括作成 (50分連続枠)")
+    st.caption("日付と時間を指定すると、休憩なしの50分枠を自動生成します。")
     
-    c1, c2, c3 = st.columns([2, 2, 1])
-    in_date = c1.text_input("日付 (例: 9/11)", value="")
-    in_time = c2.text_input("開始時間 (例: 10:00)", value="")
+    c1, c2, c3 = st.columns(3)
+    gen_date = c1.text_input("日付 (例: 9/11)", value="9/11")
+    gen_start = c2.text_input("開始 (例: 10:00)", value="10:00")
+    gen_end = c3.text_input("終了 (例: 13:00)", value="13:00")
     
-    if c3.button("追加する", type="primary"):
-        if in_date and in_time:
-            try:
-                # 日付整形
-                norm_date = normalize_date_text(in_date)
-                # 時間計算
-                t_start = datetime.strptime(in_time, "%H:%M")
-                t_end = t_start + timedelta(minutes=50)
-                
-                # 文字列結合: "9月11日(木) 10:00-10:50"
-                new_slot = f"{norm_date} {t_start.strftime('%H:%M')}-{t_end.strftime('%H:%M')}"
-                
-                # 保存
+    if st.button("プランを計算"):
+        try:
+            # 日付の正規化
+            norm_date = normalize_date_text(gen_date).split(" ")[0]
+            dummy = datetime(2000, 1, 1)
+            t_s = datetime.strptime(gen_start, "%H:%M")
+            t_e = datetime.strptime(gen_end, "%H:%M")
+            
+            # プランA: 時間内厳守
+            plan_a = []
+            curr = datetime.combine(dummy, t_s.time())
+            limit = datetime.combine(dummy, t_e.time())
+            while curr + timedelta(minutes=50) <= limit:
+                nxt = curr + timedelta(minutes=50)
+                plan_a.append(f"{norm_date} {curr.strftime('%H:%M')}-{nxt.strftime('%H:%M')}")
+                curr = nxt
+            
+            # プランB: 使い切り (はみ出し許可)
+            plan_b = []
+            curr = datetime.combine(dummy, t_s.time())
+            while curr < limit:
+                nxt = curr + timedelta(minutes=50)
+                plan_b.append(f"{norm_date} {curr.strftime('%H:%M')}-{nxt.strftime('%H:%M')}")
+                curr = nxt
+            
+            st.session_state["p_a"], st.session_state["p_b"] = plan_a, plan_b
+            st.session_state["gen_info"] = f"{norm_date} {gen_start}〜{gen_end}"
+        except: st.error("時間を正しく入力してください (例: 10:00)")
+
+    if "p_a" in st.session_state:
+        st.info(f"📅 **{st.session_state['gen_info']}** の提案プラン")
+        ca, cb = st.columns(2)
+        
+        with ca:
+            st.markdown(f"### 🅰️ 時間内 ({len(st.session_state['p_a'])}枠)")
+            st.caption("終了時間を超えない範囲で作ります。")
+            for s in st.session_state['p_a']: st.text(f"･ {s}")
+            if st.button("🅰️ このプランで追加", key="btn_a"):
                 current = load_slots()
-                if new_slot in current:
-                    st.warning("その枠は既にあります。")
-                else:
-                    save_slots(current + [new_slot])
-                    st.success(f"追加しました: {new_slot}")
-                    st.rerun()
-            except:
-                st.error("入力形式を確認してください (例: 10:00)")
-        else:
-            st.warning("日付と時間を入力してください")
+                save_slots(current + st.session_state['p_a'])
+                st.success(f"{len(st.session_state['p_a'])}枠を追加しました")
+                del st.session_state['p_a'], st.session_state['p_b']
+                st.rerun()
+
+        with cb:
+            st.markdown(f"### 🅱️ 使い切り ({len(st.session_state['p_b'])}枠)")
+            st.caption("終了時間を少し過ぎても最後まで作ります。")
+            for s in st.session_state['p_b']:
+                if s not in st.session_state['p_a']: st.markdown(f"**･ {s} (延長)**")
+                else: st.text(f"･ {s}")
+            if st.button("🅱️ このプランで追加", key="btn_b"):
+                current = load_slots()
+                save_slots(current + st.session_state['p_b'])
+                st.success(f"{len(st.session_state['p_b'])}枠を追加しました")
+                del st.session_state['p_a'], st.session_state['p_b']
+                st.rerun()
+
+    st.markdown("---")
 
     # 3. 現在のリスト管理
-    st.markdown("---")
-    st.subheader("📝 現在の登録リスト")
+    st.subheader("📝 登録済みリスト")
     current_slots = load_slots()
     
     if current_slots:
@@ -240,25 +271,22 @@ with tab2:
                 save_slots(new_list)
                 st.rerun()
                 
-        # 全削除ボタン
-        if st.button("全ての枠を削除する"):
+        if st.button("全ての枠を削除する", type="primary"):
             save_slots([])
             st.rerun()
     else:
         st.info("登録枠なし")
 
-    # 4. 学生名簿
+    # 4. 学生名簿 & シフト作成
     st.markdown("---")
     with st.expander("👥 学生名簿の編集"):
         cur_std = load_students()
-        txt = st.text_area("リスト (改行区切り)", "\n".join(cur_std))
+        txt = st.text_area("リスト", "\n".join(cur_std))
         if st.button("名簿保存"):
             save_students([x.strip() for x in txt.split('\n') if x.strip()])
             st.success("保存しました")
             st.rerun()
 
-    # 5. シフト作成 (簡易版)
-    st.markdown("---")
     if st.button("🤖 シフトを自動で割り振る"):
         current_slots = load_slots()
         df_req = load_requests()
@@ -267,36 +295,24 @@ with tab2:
         if df_req.empty or not current_slots:
             st.error("データ不足")
         else:
-            # 申し込み展開
             req_map = {}
             for _, r in df_req.iterrows():
                 if pd.notna(r["希望枠"]) and r["希望枠"]:
                     req_map[r["氏名"]] = r["希望枠"].split(",")
             
-            # 枠ごとの希望者リスト
             slot_applicants = {s: [] for s in current_slots}
             for name, wishes in req_map.items():
                 for w in wishes:
                     if w in current_slots: slot_applicants[w].append(name)
             
             final_schedule = {}
-            # 今期の回数辞書を作る
-            counts = defaultdict(int)
-            # (簡易ロジック: Historyの回数が少ない人を優先)
-            
-            # マッチング
+            # 簡易マッチング
             for slot in sort_slots(current_slots):
                 cands = slot_applicants[slot]
                 if not cands: continue
-                
-                # 候補者をシャッフルしてランダム選出 (ここは必要なら優先度ロジックに戻せます)
-                # 今回はシンプルにランダム
                 winner = random.choice(cands)
-                
-                # 重複チェック (同日2コマなどの厳密チェックは今回省略、シンプル割り当て)
                 final_schedule[slot] = winner
             
-            # 結果表示
             res = []
             for s in sort_slots(current_slots):
                 winner = final_schedule.get(s, "❌ (不成立)")
@@ -313,7 +329,7 @@ with tab2:
             del st.session_state["preview"]
 
 # ==========================================
-# タブ3: データ集計 (予備)
+# タブ3: データ集計
 # ==========================================
 with tab3:
     st.header("全期間データ")
