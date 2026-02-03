@@ -8,7 +8,7 @@ from streamlit_gsheets import GSheetsConnection
 
 # --- 設定 ---
 st.set_page_config(page_title="レッスン調整システム", page_icon="🎹", layout="wide")
-st.title("🎹 レッスン日程 自動調整システム v8")
+st.title("🎹 レッスン日程 自動調整システム v9")
 
 conn = st.connection("gsheets", type=GSheetsConnection)
 
@@ -22,7 +22,6 @@ def load_data(sheet_name, cols):
 def save_data(sheet_name, df):
     conn.update(worksheet=sheet_name, data=df)
 
-# 各シート用ラッパー
 def load_slots():
     df = load_data("Slots", 1)
     if df.empty or df.columns[0] != "候補日時": return []
@@ -50,14 +49,12 @@ def save_history(new_df):
     else: updated = pd.concat([old_df, new_df], ignore_index=True)
     save_data("History", updated)
 
-# --- ★追加: 学生名簿の読み書き ---
 def load_students():
     df = load_data("Students", 1)
     if df.empty or df.columns[0] != "氏名": return []
     return df["氏名"].dropna().tolist()
 
 def save_students(name_list):
-    # 重複除去して保存
     name_list = sorted(list(set(name_list)))
     save_data("Students", pd.DataFrame({"氏名": name_list}))
 
@@ -85,7 +82,7 @@ def sort_slots(slot_list):
 tab1, tab2, tab3 = st.tabs(["🙋 学生用: 希望提出", "📅 先生用: 管理・登録", "📊 データ集計"])
 
 # ==========================================
-# タブ1: 学生用 (名前選択式)
+# タブ1: 学生用 (完全リスト選択式)
 # ==========================================
 with tab1:
     st.header("希望スケジュールの入力")
@@ -98,33 +95,23 @@ with tab1:
         current_slots = sort_slots(raw_slots)
         df_req = load_requests()
         
-        # --- 名前入力エリア (選択式 or 新規登録) ---
+        # --- 名前選択エリア ---
         student_name = ""
         
-        # 名簿が空なら強制的に手入力、あれば選択式
         if not student_list:
-            st.info("👋 初めての利用ですね。名前を登録してください。")
-            input_mode = "新規登録"
+            st.error("⚠️ 名簿が登録されていません。先生用タブで学生を追加してください。")
         else:
-            # ラジオボタンでモード切替（横並び）
-            input_mode = st.radio("入力モード", ["リストから選択", "新しく名前を登録"], horizontal=True)
-
-        if input_mode == "リストから選択":
-            student_name = st.selectbox("自分の名前を選んでください", ["(選択してください)"] + student_list)
-            if student_name == "(選択してください)":
-                student_name = "" # 未選択扱い
-        else:
-            new_name = st.text_input("氏名を入力 (例: 松村泰佑)")
-            if new_name:
-                student_name = new_name
-                # まだ名簿になければ保存候補フラグ
-                if new_name not in student_list:
-                    st.caption(f"※ 送信時に「{new_name}」を名簿に自動登録します。")
+            # プレースホルダー付きのセレクトボックス
+            selected_val = st.selectbox("自分の名前を選んでください", ["(名前を選択してください)"] + student_list)
+            
+            if selected_val != "(名前を選択してください)":
+                student_name = selected_val
+            else:
+                st.info("☝️ 上のリストから自分の名前を選んでください。\n\n※ 名前がない場合は、先生に連絡して登録してもらってください。")
 
         # --- 以下、希望入力フォーム ---
         existing_wishes = []
         if student_name:
-            # 既存希望のロード
             if not df_req.empty and student_name in df_req["氏名"].values:
                 row = df_req[df_req["氏名"] == student_name].iloc[0]
                 if pd.notna(row["希望枠"]) and row["希望枠"]:
@@ -132,8 +119,7 @@ with tab1:
                     st.info(f"💡 {student_name}さんは現在、**{len(existing_wishes)}件** の希望を提出済みです。")
                 else:
                     st.info(f"💡 {student_name}さんの希望はまだ登録されていません。")
-        
-        if student_name:
+            
             st.markdown("---")
             st.write("▼ 参加できる日時を選んでください")
             
@@ -159,40 +145,31 @@ with tab1:
                     wishes_str = ",".join(selected)
                     new_row = {"氏名": student_name, "希望枠": wishes_str}
                     
-                    # 1. 希望データの更新
                     df_req = df_req[df_req["氏名"] != student_name]
                     new_df = pd.concat([df_req, pd.DataFrame([new_row])], ignore_index=True)
                     save_requests(new_df)
                     
-                    # 2. 名簿の自動更新 (新規の場合)
-                    if student_name not in student_list:
-                        new_list = student_list + [student_name]
-                        save_students(new_list)
-
                     st.balloons()
                     st.success(f"✅ {student_name}さんの希望を保存しました！")
                     st.rerun()
-        else:
-            if input_mode == "リストから選択" and student_list:
-                st.warning("☝️ 上のリストから名前を選んでください。")
 
 # ==========================================
-# タブ2: 先生用 (名簿管理機能を追加)
+# タブ2: 先生用
 # ==========================================
 with tab2:
     st.header("管理者メニュー")
     
-    # --- 上段: 学生名簿管理 ---
-    with st.expander("👥 学生名簿の管理 (名前の追加・削除)", expanded=False):
+    # --- 学生名簿管理 ---
+    with st.expander("👥 学生名簿の管理 (名前の追加・削除)", expanded=True):
         current_students = load_students()
-        st.caption("一行に一人ずつ名前を入力してください。ここにない名前でも、学生が「新規登録」すれば自動追加されます。")
+        st.caption("改行区切りで名前を入力し、保存してください。")
         default_std_text = "\n".join(current_students)
         new_std_text = st.text_area("学生リスト", value=default_std_text, height=150)
         
         if st.button("名簿を更新して保存"):
             new_std_list = [line.strip() for line in new_std_text.split('\n') if line.strip()]
             save_students(new_std_list)
-            st.success("名簿を更新しました！学生画面のリストに反映されます。")
+            st.success("名簿を更新しました！タブ1で確認できます。")
             st.rerun()
 
     st.markdown("---")
@@ -216,7 +193,7 @@ with tab2:
     else:
         st.info("登録枠なし")
 
-    # --- 新規追加ウィザード (v7維持) ---
+    # --- 新規追加ウィザード ---
     st.markdown("#### 🪄 日程の一括作成")
     c1, c2, c3 = st.columns(3)
     gen_date = c1.text_input("日付 (例: 10/4(土))", value="10/4(土)")
