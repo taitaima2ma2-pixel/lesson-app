@@ -9,7 +9,7 @@ from supabase import create_client, Client
 
 # --- 設定 ---
 st.set_page_config(page_title="レッスン調整システム", page_icon="🎹", layout="wide")
-st.title("🎹 レッスン日程 自動調整システム v20")
+st.title("🎹 レッスン日程 自動調整システム v21")
 
 # --- Supabase接続 ---
 try:
@@ -206,7 +206,6 @@ with tab1:
                         if st.checkbox(f"🙆‍♂️ {d_key} は何時でもOK", value=all_checked, key=f"all_{d_key}"):
                             final_selected.extend(slots)
                         else:
-                            # 縦一列表示 (スマホで見やすく)
                             for slot in slots:
                                 label = slot.replace(d_key, "").strip()
                                 is_on = slot in existing_wishes
@@ -236,7 +235,7 @@ with tab2:
 
     st.markdown("---")
     
-    # 登録済みリスト (要約表示)
+    # 登録済みリスト
     st.subheader("📝 登録済みリスト")
     current_slots = sort_slots(load_slots())
     
@@ -355,7 +354,6 @@ with tab2:
             final_schedule = {}
             current_batch_counts = defaultdict(int)
             daily_counts = defaultdict(lambda: defaultdict(int))
-            # 誰が何時に終わったか記録 {name: {date: last_end_time}}
             daily_last_end = defaultdict(lambda: defaultdict(str))
             
             sorted_slots_process = sort_slots(current_slots)
@@ -365,50 +363,30 @@ with tab2:
                 if not cands: continue
 
                 semester = get_semester(slot)
-                # 時間分解
                 match_dt = re.match(r'(.*?)\s*(\d{1,2}:\d{2})-(\d{1,2}:\d{2})', slot)
-                if match_dt:
-                    date_part, s_time, e_time = match_dt.groups()
-                else:
-                    date_part = slot.split(" ")[0]
-                    s_time, e_time = "00:00", "00:00"
+                if match_dt: date_part, s_time, e_time = match_dt.groups()
+                else: date_part, s_time, e_time = slot.split(" ")[0], "00:00", "00:00"
 
                 scored_cands = []
                 for student in cands:
-                    # 1日2枠上限
                     if daily_counts[student][date_part] >= 2: continue
-                    
                     past_count = len(df_hist[ (df_hist["受講者"]==student) & (df_hist["学期"]==semester) ])
                     total_count = past_count + current_batch_counts[student]
-                    
-                    # ★ロジック変更: 2枠目判定
                     penalty = 0
                     if daily_counts[student][date_part] == 1:
-                        # 2枠目を取るなら「連続」じゃないとダメ
                         prev_end = daily_last_end[student][date_part]
-                        
-                        if prev_end == s_time:
-                            # 連続成功！ -> ボーナス (優先的に枠をあげる)
-                            penalty = -50 
-                        else:
-                            # 連続じゃない(飛び石) -> 大ペナルティ (絶対ダメ)
-                            penalty = 999 
-                    
+                        if prev_end == s_time: penalty = -50 
+                        else: penalty = 999 
                     score = total_count + penalty
                     scored_cands.append( (score, random.random(), student) )
                 
                 if scored_cands:
                     scored_cands.sort()
-                    # スコアが900以上の人しかいなければ、飛び石確定なので誰も入れない？
-                    # 今回は「誰もいないよりはマシ」として入れるか、厳密に排除するか。
-                    # 「変更で」という要望なので、厳密にやるならここで continue だが、
-                    # まずはペナルティ順で処理。
-                    
                     winner = scored_cands[0][2]
                     final_schedule[slot] = winner
                     current_batch_counts[winner] += 1
                     daily_counts[winner][date_part] += 1
-                    daily_last_end[winner][date_part] = e_time # 終了時間を記録
+                    daily_last_end[winner][date_part] = e_time
             
             res = []
             for s in sort_slots(current_slots):
@@ -422,6 +400,15 @@ with tab2:
             save_history_new(to_save)
             st.success("保存完了！")
             del st.session_state["preview"]
+
+    # ★ここが新機能: 履歴リセットボタン
+    st.markdown("---")
+    with st.expander("🗑️ 履歴データの初期化 (レッスン回数リセット)"):
+        st.warning("これまでのレッスン回数や履歴がすべて消えます。半期が変わるタイミングなどで使ってください。")
+        if st.button("履歴を全て削除する", type="primary"):
+            supabase.table("history").delete().neq("id", 0).execute()
+            st.success("履歴をリセットしました！")
+            st.rerun()
 
 # ==========================================
 # タブ3: 集計
