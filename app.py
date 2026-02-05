@@ -5,15 +5,23 @@ import re
 import unicodedata
 from datetime import datetime, timedelta
 from collections import defaultdict
-from streamlit_gsheets import GSheetsConnection
+from supabase import create_client, Client
 
 # --- 設定 ---
 st.set_page_config(page_title="レッスン調整システム", page_icon="🎹", layout="wide")
-st.title("🎹 レッスン日程 自動調整システム v15 (安全版)")
+st.title("🎹 レッスン日程 自動調整システム v16 (Supabase版)")
 
-conn = st.connection("gsheets", type=GSheetsConnection)
+# --- Supabase接続 ---
+# Secretsから情報を取得して接続
+try:
+    url = st.secrets["connections"]["supabase"]["SUPABASE_URL"]
+    key = st.secrets["connections"]["supabase"]["SUPABASE_KEY"]
+    supabase: Client = create_client(url, key)
+except:
+    st.error("Secretsの設定が間違っています。[connections.supabase]を確認してください。")
+    st.stop()
 
-# --- 関数群 ---
+# --- 関数群 (Supabase用) ---
 
 def normalize_date_text(text):
     text = unicodedata.normalize('NFKC', text)
@@ -22,9 +30,8 @@ def normalize_date_text(text):
     month, day = int(date_match.group(1)), int(date_match.group(2))
     now = datetime.now()
     year = now.year
-    try:
-        dt = datetime(year, month, day)
-    except ValueError: return text
+    try: dt = datetime(year, month, day)
+    except: return text
     weekdays = ["月", "火", "水", "木", "金", "土", "日"]
     wk = weekdays[dt.weekday()]
     base_date = f"{month}月{day}日({wk})"
@@ -35,8 +42,7 @@ def normalize_date_text(text):
 def get_semester(date_str):
     match = re.search(r'(\d{1,2})月', date_str)
     if match:
-        month = int(match.group(1))
-        if 4 <= month <= 8: return "前期"
+        if 4 <= int(match.group(1)) <= 8: return "前期"
         else: return "後期"
     return "不明"
 
@@ -46,75 +52,74 @@ def sort_slots(slot_list):
             match = re.search(r'(\d{1,2})月(\d{1,2})日.*?(\d{1,2}):(\d{2})', s)
             if match:
                 mo, d, h, m = map(int, match.groups())
-                year_offset = 1 if mo <= 3 else 0
-                return (year_offset, mo, d, h, m)
+                return (1 if mo <= 3 else 0, mo, d, h, m)
             return (99, 99, 99, 99, 99)
         except: return (99, 99, 99, 99, 99)
     return sorted(slot_list, key=parse_key)
 
-# --- DB操作 (エラーを握りつぶさない安全設計) ---
-def load_data(sheet_name, cols):
-    # try-exceptを外して、シートがない場合は明確にエラーを出す
-    # ttl=0 でキャッシュを無効化
-    df = conn.read(worksheet=sheet_name, usecols=list(range(cols)), ttl=0)
-    return df.dropna(how="all")
+# --- DB操作 (Supabase) ---
 
-def save_data(sheet_name, df):
-    conn.update(worksheet=sheet_name, data=df)
-
-# 各シートのラッパー
 def load_slots():
-    try:
-        df = load_data("Slots", 1)
-        if df.empty: return []
-        # カラム名チェック
-        if df.columns[0] != "候補日時":
-            # もしカラム名がおかしければ、データが壊れている可能性あり
-            return []
-        return df["候補日時"].dropna().tolist()
-    except Exception as e:
-        # Slotsシート読み込みエラーは致命的なので表示するかも
-        return []
+    # date_text カラムを取得
+    response = supabase.table("slots").select("date_text").execute()
+    return [item['date_text'] for item in response.data]
 
 def save_slots(slot_list):
+    # 全削除 -> 全追加 (シンプル実装)
+    # 実際は差分更新が良いが、データ量が少ないのでこれで安定する
+    # 1. 重複排除とソート
     unique_list = sorted(list(set(slot_list)), key=lambda s: sort_slots([s])[0])
-    save_data("Slots", pd.DataFrame({"候補日時": unique_list}))
+    
+    # 2. テーブルを空にする (delete all)
+    supabase.table("slots").delete().neq("id", 0).execute() 
+    
+    # 3. 追加
+    if unique_list:
+        data = [{"date_text": s} for s in unique_list]
+        supabase.table("slots").insert(data).execute()
 
 def load_requests():
-    try:
-        df = load_data("Requests", 2)
-        if df.shape[1] < 2: return pd.DataFrame(columns=["氏名", "希望枠"])
-        return df
-    except Exception:
-        # シートがない場合などは空を返す
-        return pd.DataFrame(columns=["氏名", "希望枠"])
+    response = supabase.table("requests").select("*").execute()
+    if not response.data: return pd.DataFrame(columns=["氏名", "希望枠"])
+    # カラム名を合わせる
+    df = pd.DataFrame(response.data)
+    return df.rename(columns={"student_name": "氏名", "wishes": "希望枠"})
 
-def save_requests(new_df):
-    save_data("Requests", new_df)
+def save_requests_row(name, wishes_str):
+    # 個別更新 (Upsert)
+    data = {"student_name": name, "wishes": wishes_str}
+    # student_nameが重複したら更新、なければ挿入
+    supabase.table("requests").upsert(data, on_conflict="student_name").execute()
 
 def load_history():
-    try:
-        df = load_data("History", 3)
-        if df.shape[1] < 3: return pd.DataFrame(columns=["日時", "受講者", "学期"])
-        return df
-    except: return pd.DataFrame(columns=["日時", "受講者", "学期"])
+    response = supabase.table("history").select("*").execute()
+    if not response.data: return pd.DataFrame(columns=["日時", "受講者", "学期"])
+    df = pd.DataFrame(response.data)
+    return df.rename(columns={"date_text": "日時", "student_name": "受講者", "semester": "学期"})
 
-def save_history(new_df):
-    old_df = load_history()
-    if old_df.empty: updated = new_df
-    else: updated = pd.concat([old_df, new_df], ignore_index=True)
-    save_data("History", updated)
+def save_history_new(df_new):
+    # 新しい履歴を追加 (Insert)
+    if df_new.empty: return
+    # DataFrame -> List of Dict
+    data = []
+    for _, row in df_new.iterrows():
+        data.append({
+            "date_text": row["日時"],
+            "student_name": row["受講者"],
+            "semester": row["学期"]
+        })
+    supabase.table("history").insert(data).execute()
 
 def load_students():
-    try:
-        df = load_data("Students", 1)
-        if df.empty: return []
-        return df["氏名"].dropna().tolist()
-    except: return []
+    response = supabase.table("students").select("name").execute()
+    return [item['name'] for item in response.data]
 
 def save_students(name_list):
     name_list = sorted(list(set(name_list)))
-    save_data("Students", pd.DataFrame({"氏名": name_list}))
+    supabase.table("students").delete().neq("id", 0).execute()
+    if name_list:
+        data = [{"name": n} for n in name_list]
+        supabase.table("students").insert(data).execute()
 
 # --- 画面構成 ---
 tab1, tab2, tab3 = st.tabs(["🙋 学生用", "📅 先生用 (登録・管理)", "📊 データ集計"])
@@ -124,23 +129,11 @@ tab1, tab2, tab3 = st.tabs(["🙋 学生用", "📅 先生用 (登録・管理)"
 # ==========================================
 with tab1:
     st.header("レッスン希望の提出")
-    
-    # データのロード確認
     raw_slots = load_slots()
     student_list = load_students()
     
     if not raw_slots:
-        st.warning("現在、募集中のレッスン枠はありません。（またはSlotsシートが読み込めません）")
-        # デバッグ用：なぜ空なのか確認
-        try:
-            test_df = load_data("Slots", 1)
-            if test_df.empty:
-                st.caption("※ Slotsシートは存在しますが、データが空です。")
-            elif test_df.columns[0] != "候補日時":
-                st.error(f"⚠️ エラー: Slotsシートの1行目が「{test_df.columns[0]}」になっています。「候補日時」である必要があります。シートが上書きされた可能性があります。")
-        except:
-            st.error("⚠️ エラー: スプレッドシートに「Slots」という名前のシートが見つかりません。")
-
+        st.warning("現在、募集中のレッスン枠はありません。")
     else:
         current_slots = sort_slots(raw_slots)
         df_req = load_requests()
@@ -160,7 +153,6 @@ with tab1:
                     existing_wishes = row["希望枠"].split(",")
             
             st.info(f"ログイン中: **{student_name}** さん")
-            
             slots_by_date = defaultdict(list)
             for slot in current_slots:
                 d_key = slot.split(" ")[0]
@@ -185,19 +177,11 @@ with tab1:
                 if st.form_submit_button("希望を送信する", type="primary"):
                     final_selected = sorted(list(set(final_selected)), key=lambda s: current_slots.index(s) if s in current_slots else 999)
                     wishes_str = ",".join(final_selected)
-                    new_row = {"氏名": student_name, "希望枠": wishes_str}
                     
-                    # リクエストの更新処理
-                    df_req = df_req[df_req["氏名"] != student_name]
-                    new_df = pd.concat([df_req, pd.DataFrame([new_row])], ignore_index=True)
-                    
-                    try:
-                        save_requests(new_df)
-                        st.success("✅ 保存しました！")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"保存エラー: {e}")
-                        st.error("「Requests」シートが存在するか確認してください。")
+                    # Supabaseに保存 (Upsert)
+                    save_requests_row(student_name, wishes_str)
+                    st.success("✅ 保存しました！(Supabase)")
+                    st.rerun()
 
 # ==========================================
 # タブ2: 先生用
@@ -205,6 +189,7 @@ with tab1:
 with tab2:
     st.header("管理者メニュー")
     
+    # レッスン回数
     with st.expander("📊 半期ごとのレッスン回数", expanded=False):
         df_h = load_history()
         if not df_h.empty:
@@ -214,7 +199,6 @@ with tab2:
 
     st.markdown("---")
     st.subheader("🪄 日程の一括作成 (50分連続枠)")
-    
     c1, c2, c3 = st.columns(3)
     gen_date = c1.text_input("日付 (例: 9/11)", value="9/11")
     gen_start = c2.text_input("開始 (例: 10:00)", value="10:00")
@@ -273,7 +257,6 @@ with tab2:
     st.markdown("---")
     st.subheader("📝 登録済みリスト")
     current_slots = load_slots()
-    
     if current_slots:
         for slot in current_slots:
             col_txt, col_del = st.columns([4, 1])
@@ -304,14 +287,17 @@ with tab2:
             req_map = {}
             for _, r in df_req.iterrows():
                 if pd.notna(r["希望枠"]) and r["希望枠"]: req_map[r["氏名"]] = r["希望枠"].split(",")
+            
             slot_applicants = {s: [] for s in current_slots}
             for name, wishes in req_map.items():
                 for w in wishes:
                     if w in current_slots: slot_applicants[w].append(name)
+            
             final_schedule = {}
             for slot in sort_slots(current_slots):
                 cands = slot_applicants[slot]
                 if cands: final_schedule[slot] = random.choice(cands)
+            
             res = []
             for s in sort_slots(current_slots):
                 res.append({"日時": s, "受講者": final_schedule.get(s, "❌"), "学期": get_semester(s)})
@@ -319,10 +305,11 @@ with tab2:
             st.table(st.session_state["preview"])
 
     if "preview" in st.session_state:
-        if st.button("確定保存"):
+        if st.button("確定して履歴に保存"):
             to_save = st.session_state["preview"][ st.session_state["preview"]["受講者"].str.contains("❌") == False ]
-            save_history(to_save)
-            st.success("保存完了"); del st.session_state["preview"]
+            save_history_new(to_save)
+            st.success("保存完了！")
+            del st.session_state["preview"]
 
 # ==========================================
 # タブ3: 集計
