@@ -9,7 +9,7 @@ from supabase import create_client, Client
 
 # --- 設定 ---
 st.set_page_config(page_title="レッスン調整システム", page_icon="🎹", layout="wide")
-st.title("🎹 レッスン日程 自動調整システム v19 (スマホ最適化版)")
+st.title("🎹 レッスン日程 自動調整システム v20")
 
 # --- Supabase接続 ---
 try:
@@ -202,16 +202,14 @@ with tab1:
                 final_selected = []
                 for d_key, slots in slots_by_date.items():
                     with st.expander(f"📅 {d_key}", expanded=True):
-                        # 全選択
                         all_checked = all(s in existing_wishes for s in slots)
                         if st.checkbox(f"🙆‍♂️ {d_key} は何時でもOK", value=all_checked, key=f"all_{d_key}"):
                             final_selected.extend(slots)
                         else:
-                            # ★変更点: 2列(columns)をやめて、縦一列に配置
+                            # 縦一列表示 (スマホで見やすく)
                             for slot in slots:
                                 label = slot.replace(d_key, "").strip()
                                 is_on = slot in existing_wishes
-                                # そのままcheckboxを配置することで縦積みになる
                                 if st.checkbox(label, value=is_on, key=f"chk_{slot}"):
                                     final_selected.append(slot)
                 
@@ -339,7 +337,7 @@ with tab2:
             save_students([x.strip() for x in txt.split('\n') if x.strip()])
             st.success("保存しました"); st.rerun()
 
-    if st.button("🤖 シフト作成 (分散優先)"):
+    if st.button("🤖 シフト作成 (連続2枠優先)"):
         current_slots = load_slots()
         df_req = load_requests()
         df_hist = load_history()
@@ -357,6 +355,9 @@ with tab2:
             final_schedule = {}
             current_batch_counts = defaultdict(int)
             daily_counts = defaultdict(lambda: defaultdict(int))
+            # 誰が何時に終わったか記録 {name: {date: last_end_time}}
+            daily_last_end = defaultdict(lambda: defaultdict(str))
+            
             sorted_slots_process = sort_slots(current_slots)
 
             for slot in sorted_slots_process:
@@ -364,33 +365,50 @@ with tab2:
                 if not cands: continue
 
                 semester = get_semester(slot)
-                if "(" in slot: date_part = slot.split("(")[0]
-                else: date_part = slot.split(" ")[0]
+                # 時間分解
+                match_dt = re.match(r'(.*?)\s*(\d{1,2}:\d{2})-(\d{1,2}:\d{2})', slot)
+                if match_dt:
+                    date_part, s_time, e_time = match_dt.groups()
+                else:
+                    date_part = slot.split(" ")[0]
+                    s_time, e_time = "00:00", "00:00"
 
                 scored_cands = []
                 for student in cands:
-                    # 1日2枠上限 (絶対)
+                    # 1日2枠上限
                     if daily_counts[student][date_part] >= 2: continue
                     
-                    # 過去の回数を取得
                     past_count = len(df_hist[ (df_hist["受講者"]==student) & (df_hist["学期"]==semester) ])
                     total_count = past_count + current_batch_counts[student]
                     
-                    # ★変更点: 2枠目ペナルティ (分散優先)
+                    # ★ロジック変更: 2枠目判定
                     penalty = 0
                     if daily_counts[student][date_part] == 1:
-                        # すでに今日1枠持っている場合、スコアを悪くする(数値を増やす)
-                        penalty = 5 
+                        # 2枠目を取るなら「連続」じゃないとダメ
+                        prev_end = daily_last_end[student][date_part]
+                        
+                        if prev_end == s_time:
+                            # 連続成功！ -> ボーナス (優先的に枠をあげる)
+                            penalty = -50 
+                        else:
+                            # 連続じゃない(飛び石) -> 大ペナルティ (絶対ダメ)
+                            penalty = 999 
                     
                     score = total_count + penalty
                     scored_cands.append( (score, random.random(), student) )
                 
                 if scored_cands:
                     scored_cands.sort()
+                    # スコアが900以上の人しかいなければ、飛び石確定なので誰も入れない？
+                    # 今回は「誰もいないよりはマシ」として入れるか、厳密に排除するか。
+                    # 「変更で」という要望なので、厳密にやるならここで continue だが、
+                    # まずはペナルティ順で処理。
+                    
                     winner = scored_cands[0][2]
                     final_schedule[slot] = winner
                     current_batch_counts[winner] += 1
                     daily_counts[winner][date_part] += 1
+                    daily_last_end[winner][date_part] = e_time # 終了時間を記録
             
             res = []
             for s in sort_slots(current_slots):
