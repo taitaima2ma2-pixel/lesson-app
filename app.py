@@ -9,7 +9,7 @@ from supabase import create_client, Client
 
 # --- 設定 ---
 st.set_page_config(page_title="レッスン調整システム", page_icon="🎹", layout="wide")
-st.title("🎹 レッスン日程 自動調整システム v17 (Supabase完全版)")
+st.title("🎹 レッスン日程 自動調整システム v18")
 
 # --- Supabase接続 ---
 try:
@@ -20,23 +20,16 @@ except:
     st.error("Secretsの設定が間違っています。[connections.supabase]を確認してください。")
     st.stop()
 
-# --- 強力な入力補正関数 (v14のロジックを移植) ---
+# --- 関数群 ---
+
 def normalize_date_text(text):
-    """
-    あらゆる入力形式を「M月D日(曜) HH:MM-HH:MM」に統一する関数
-    """
-    # 1. 全角→半角 (１０：００ -> 10:00)
     text = unicodedata.normalize('NFKC', text)
-    
-    # 2. 日付の検出 (M/D, M-D, M月D日)
     date_match = re.search(r'(\d{1,2})[\/\-月\.](\d{1,2})', text)
-    if not date_match: return text # 日付なしはスキップ
+    if not date_match: return text
         
     month, day = int(date_match.group(1)), int(date_match.group(2))
     now = datetime.now()
     year = now.year
-    
-    # 簡易的な年補正 (過去の日付なら来年扱いにするなど必要なら追加)
     try: dt = datetime(year, month, day)
     except: return text
     
@@ -44,23 +37,16 @@ def normalize_date_text(text):
     wk = weekdays[dt.weekday()]
     date_str = f"{month}月{day}日({wk})"
     
-    # 3. 時間の検出と補正
-    # "10:00" っぽい文字列を探す
     time_match = re.search(r'(\d{1,2}[:：]\d{2})', text)
     if time_match:
-        # コロンを半角に統一
         start_time_str = time_match.group(1).replace("：", ":")
-        
-        # すでに範囲指定があるかチェック ("-"Or"~")
         range_match = re.search(r'(\d{1,2}[:：]\d{2})\s*[\-~〜]\s*(\d{1,2}[:：]\d{2})', text)
         
         if range_match:
-            # 範囲指定あり -> そのまま整形
             s_t = range_match.group(1).replace("：", ":")
             e_t = range_match.group(2).replace("：", ":")
             return f"{date_str} {s_t}-{e_t}"
         else:
-            # 範囲指定なし -> 自動で50分足す (★ここが重要)
             try:
                 st_obj = datetime.strptime(start_time_str, "%H:%M")
                 et_obj = st_obj + timedelta(minutes=50)
@@ -81,6 +67,7 @@ def get_semester(date_str):
 def sort_slots(slot_list):
     def parse_key(s):
         try:
+            # 日付と時間を数値化してソートキーにする
             match = re.search(r'(\d{1,2})月(\d{1,2})日.*?(\d{1,2}):(\d{2})', s)
             if match:
                 mo, d, h, m = map(int, match.groups())
@@ -89,265 +76,24 @@ def sort_slots(slot_list):
         except: return (99, 99, 99, 99, 99)
     return sorted(slot_list, key=parse_key)
 
-# --- DB操作 (Supabase) ---
-
-def load_slots():
-    response = supabase.table("slots").select("date_text").execute()
-    return [item['date_text'] for item in response.data]
-
-def save_slots(slot_list):
-    # 強力な正規化を通してから保存
-    normalized_list = [normalize_date_text(s) for s in slot_list]
-    unique_list = sorted(list(set(normalized_list)), key=lambda s: sort_slots([s])[0])
+def group_continuous_slots(sorted_slots):
+    """
+    連続した枠をまとめて表示するための関数
+    例: 10:00-10:50, 10:50-11:40 -> "10:00〜11:40 (2枠)"
+    """
+    if not sorted_slots: return []
     
-    supabase.table("slots").delete().neq("id", 0).execute() 
-    if unique_list:
-        data = [{"date_text": s} for s in unique_list]
-        supabase.table("slots").insert(data).execute()
-
-def load_requests():
-    response = supabase.table("requests").select("*").execute()
-    if not response.data: return pd.DataFrame(columns=["氏名", "希望枠"])
-    df = pd.DataFrame(response.data)
-    return df.rename(columns={"student_name": "氏名", "wishes": "希望枠"})
-
-def save_requests_row(name, wishes_str):
-    data = {"student_name": name, "wishes": wishes_str}
-    supabase.table("requests").upsert(data, on_conflict="student_name").execute()
-
-def load_history():
-    response = supabase.table("history").select("*").execute()
-    if not response.data: return pd.DataFrame(columns=["日時", "受講者", "学期"])
-    df = pd.DataFrame(response.data)
-    return df.rename(columns={"date_text": "日時", "student_name": "受講者", "semester": "学期"})
-
-def save_history_new(df_new):
-    if df_new.empty: return
-    data = []
-    for _, row in df_new.iterrows():
-        data.append({
-            "date_text": row["日時"],
-            "student_name": row["受講者"],
-            "semester": row["学期"]
-        })
-    supabase.table("history").insert(data).execute()
-
-def load_students():
-    response = supabase.table("students").select("name").execute()
-    return [item['name'] for item in response.data]
-
-def save_students(name_list):
-    name_list = sorted(list(set(name_list)))
-    supabase.table("students").delete().neq("id", 0).execute()
-    if name_list:
-        data = [{"name": n} for n in name_list]
-        supabase.table("students").insert(data).execute()
-
-# --- 画面構成 ---
-tab1, tab2, tab3 = st.tabs(["🙋 学生用", "📅 先生用 (登録・管理)", "📊 データ集計"])
-
-# ==========================================
-# タブ1: 学生用
-# ==========================================
-with tab1:
-    st.header("レッスン希望の提出")
-    raw_slots = load_slots()
-    student_list = load_students()
-    
-    if not raw_slots:
-        st.warning("現在、募集中のレッスン枠はありません。")
-    else:
-        current_slots = sort_slots(raw_slots)
-        df_req = load_requests()
+    # 日付ごとに分ける
+    grouped_by_date = defaultdict(list)
+    for s in sorted_slots:
+        d_part = s.split(" ")[0]
+        t_part = s.split(" ")[1] if " " in s else ""
+        grouped_by_date[d_part].append(t_part)
         
-        student_name = ""
-        if not student_list:
-            st.error("名簿が登録されていません。")
-        else:
-            val = st.selectbox("氏名を選択", ["(選択してください)"] + student_list)
-            if val != "(選択してください)": student_name = val
-
-        if student_name:
-            existing_wishes = []
-            if not df_req.empty and student_name in df_req["氏名"].values:
-                row = df_req[df_req["氏名"] == student_name].iloc[0]
-                if pd.notna(row["希望枠"]) and row["希望枠"]:
-                    existing_wishes = row["希望枠"].split(",")
-            
-            st.info(f"ログイン中: **{student_name}** さん")
-            slots_by_date = defaultdict(list)
-            for slot in current_slots:
-                d_key = slot.split(" ")[0]
-                slots_by_date[d_key].append(slot)
-
-            with st.form("student_form"):
-                final_selected = []
-                for d_key, slots in slots_by_date.items():
-                    with st.expander(f"📅 {d_key}", expanded=True):
-                        all_checked = all(s in existing_wishes for s in slots)
-                        if st.checkbox(f"🙆‍♂️ {d_key} は何時でもOK", value=all_checked, key=f"all_{d_key}"):
-                            final_selected.extend(slots)
-                        else:
-                            cols = st.columns(2)
-                            for i, slot in enumerate(slots):
-                                label = slot.replace(d_key, "").strip()
-                                is_on = slot in existing_wishes
-                                if cols[i % 2].checkbox(label, value=is_on, key=f"chk_{slot}"):
-                                    final_selected.append(slot)
-                
-                st.markdown("---")
-                if st.form_submit_button("希望を送信する", type="primary"):
-                    final_selected = sorted(list(set(final_selected)), key=lambda s: current_slots.index(s) if s in current_slots else 999)
-                    wishes_str = ",".join(final_selected)
-                    save_requests_row(student_name, wishes_str)
-                    st.success("✅ 保存しました！")
-                    st.rerun()
-
-# ==========================================
-# タブ2: 先生用
-# ==========================================
-with tab2:
-    st.header("管理者メニュー")
+    summary_list = []
     
-    with st.expander("📊 半期ごとのレッスン回数", expanded=False):
-        df_h = load_history()
-        if not df_h.empty:
-            count_table = pd.crosstab(df_h["受講者"], df_h["学期"], margins=True, margins_name="合計")
-            st.dataframe(count_table, use_container_width=True)
-        else: st.info("履歴なし")
-
-    st.markdown("---")
-    st.subheader("🪄 日程の一括作成 (50分連続枠)")
-    c1, c2, c3 = st.columns(3)
-    gen_date = c1.text_input("日付 (例: 9/11)", value="9/11")
-    gen_start = c2.text_input("開始 (例: 10:00)", value="10:00")
-    gen_end = c3.text_input("終了 (例: 13:00)", value="13:00")
-    
-    if st.button("プランを計算"):
-        try:
-            # 入力補正: 全角などを直す
-            clean_date = normalize_date_text(gen_date).split(" ")[0]
-            clean_start = unicodedata.normalize('NFKC', gen_start).replace("：", ":")
-            clean_end = unicodedata.normalize('NFKC', gen_end).replace("：", ":")
-            
-            dummy = datetime(2000, 1, 1)
-            t_s = datetime.strptime(clean_start, "%H:%M")
-            t_e = datetime.strptime(clean_end, "%H:%M")
-            
-            plan_a = []
-            curr = datetime.combine(dummy, t_s.time())
-            limit = datetime.combine(dummy, t_e.time())
-            while curr + timedelta(minutes=50) <= limit:
-                nxt = curr + timedelta(minutes=50)
-                plan_a.append(f"{clean_date} {curr.strftime('%H:%M')}-{nxt.strftime('%H:%M')}")
-                curr = nxt
-            
-            plan_b = []
-            curr = datetime.combine(dummy, t_s.time())
-            while curr < limit:
-                nxt = curr + timedelta(minutes=50)
-                plan_b.append(f"{clean_date} {curr.strftime('%H:%M')}-{nxt.strftime('%H:%M')}")
-                curr = nxt
-            
-            st.session_state["p_a"], st.session_state["p_b"] = plan_a, plan_b
-            st.session_state["gen_info"] = f"{clean_date} {clean_start}〜{clean_end}"
-        except: st.error("時間を正しく入力してください")
-
-    if "p_a" in st.session_state:
-        st.info(f"📅 **{st.session_state['gen_info']}** の提案")
-        ca, cb = st.columns(2)
-        with ca:
-            st.markdown(f"### 🅰️ 時間内 ({len(st.session_state['p_a'])}枠)")
-            for s in st.session_state['p_a']: st.text(f"･ {s}")
-            if st.button("🅰️ 追加", key="btn_a"):
-                current = load_slots()
-                save_slots(current + st.session_state['p_a'])
-                st.success("追加しました")
-                del st.session_state['p_a'], st.session_state['p_b']
-                st.rerun()
-        with cb:
-            st.markdown(f"### 🅱️ 使い切り ({len(st.session_state['p_b'])}枠)")
-            for s in st.session_state['p_b']:
-                if s not in st.session_state['p_a']: st.markdown(f"**･ {s} (延長)**")
-                else: st.text(f"･ {s}")
-            if st.button("🅱️ 追加", key="btn_b"):
-                current = load_slots()
-                save_slots(current + st.session_state['p_b'])
-                st.success("追加しました")
-                del st.session_state['p_a'], st.session_state['p_b']
-                st.rerun()
-
-    st.markdown("---")
-    st.subheader("📝 登録済みリスト")
-    current_slots = load_slots()
-    
-    # 削除ボタン付きリスト
-    if current_slots:
-        for slot in current_slots:
-            col_txt, col_del = st.columns([4, 1])
-            col_txt.text(f"･ {slot}")
-            if col_del.button("削除", key=f"del_{slot}"):
-                new_list = [s for s in current_slots if s != slot]
-                save_slots(new_list)
-                st.rerun()
-        if st.button("全削除", type="primary"):
-            save_slots([]); st.rerun()
-    else: st.info("登録なし")
-
-    st.markdown("---")
-    
-    # 手動編集エリア (自動補正あり)
-    with st.expander("【方法B】リストを直接編集 (開始時間だけでOK！)"):
-        st.info("💡 「9/11 10:00」と書けば、自動で「9月11日(木) 10:00-10:50」になります。")
-        edited_text = st.text_area("編集エリア", value="\n".join(current_slots), height=200)
-        if st.button("この内容で上書き保存する", type="primary"):
-            lines = [l.strip() for l in edited_text.split('\n') if l.strip()]
-            save_slots(lines)
-            st.success("保存しました！ (50分枠に自動補正されました)")
-            st.rerun()
-
-    st.markdown("---")
-    with st.expander("👥 名簿編集"):
-        cur_std = load_students()
-        txt = st.text_area("リスト", "\n".join(cur_std))
-        if st.button("名簿保存"):
-            save_students([x.strip() for x in txt.split('\n') if x.strip()])
-            st.success("保存しました"); st.rerun()
-
-    if st.button("🤖 シフト作成"):
-        current_slots = load_slots()
-        df_req = load_requests()
-        df_hist = load_history()
+    for date_key, times in grouped_by_date.items():
+        # 時間順にソート済み前提
+        if not times: continue
         
-        if df_req.empty or not current_slots: st.error("データ不足")
-        else:
-            req_map = {}
-            for _, r in df_req.iterrows():
-                if pd.notna(r["希望枠"]) and r["希望枠"]: req_map[r["氏名"]] = r["希望枠"].split(",")
-            slot_applicants = {s: [] for s in current_slots}
-            for name, wishes in req_map.items():
-                for w in wishes:
-                    if w in current_slots: slot_applicants[w].append(name)
-            final_schedule = {}
-            for slot in sort_slots(current_slots):
-                cands = slot_applicants[slot]
-                if cands: final_schedule[slot] = random.choice(cands)
-            res = []
-            for s in sort_slots(current_slots):
-                res.append({"日時": s, "受講者": final_schedule.get(s, "❌"), "学期": get_semester(s)})
-            st.session_state["preview"] = pd.DataFrame(res)
-            st.table(st.session_state["preview"])
-
-    if "preview" in st.session_state:
-        if st.button("確定して履歴に保存"):
-            to_save = st.session_state["preview"][ st.session_state["preview"]["受講者"].str.contains("❌") == False ]
-            save_history_new(to_save)
-            st.success("保存完了！")
-            del st.session_state["preview"]
-
-# ==========================================
-# タブ3: 集計
-# ==========================================
-with tab3:
-    st.header("全期間データ")
-    st.dataframe(load_history())
+        current_start
