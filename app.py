@@ -9,7 +9,7 @@ from supabase import create_client, Client
 
 # --- 設定 ---
 st.set_page_config(page_title="レッスン調整システム", page_icon="🎹", layout="wide")
-st.title("🎹 レッスン日程 自動調整システム v23 (完結版)")
+st.title("🎹 レッスン日程 自動調整システム プロトタイプ")
 
 # --- Supabase接続 ---
 try:
