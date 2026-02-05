@@ -9,7 +9,7 @@ from supabase import create_client, Client
 
 # --- 設定 ---
 st.set_page_config(page_title="レッスン調整システム", page_icon="🎹", layout="wide")
-st.title("🎹 レッスン日程 自動調整システム v22")
+st.title("🎹 レッスン日程 自動調整システム v23 (完結版)")
 
 # --- Supabase接続 ---
 try:
@@ -17,7 +17,7 @@ try:
     key = st.secrets["connections"]["supabase"]["SUPABASE_KEY"]
     supabase: Client = create_client(url, key)
 except:
-    st.error("Secretsの設定が間違っています。[connections.supabase]を確認してください。")
+    st.error("Secretsの設定が間違っています。")
     st.stop()
 
 # --- 関数群 ---
@@ -119,12 +119,16 @@ def save_slots(slot_list):
 
 def load_requests():
     response = supabase.table("requests").select("*").execute()
-    if not response.data: return pd.DataFrame(columns=["氏名", "希望枠"])
+    if not response.data: return pd.DataFrame(columns=["氏名", "希望枠", "メモ"])
     df = pd.DataFrame(response.data)
-    return df.rename(columns={"student_name": "氏名", "wishes": "希望枠"})
+    # カラム名マッピング (memoがない場合も考慮)
+    rename_map = {"student_name": "氏名", "wishes": "希望枠"}
+    if "memo" in df.columns: rename_map["memo"] = "メモ"
+    else: df["メモ"] = ""
+    return df.rename(columns=rename_map)
 
-def save_requests_row(name, wishes_str):
-    data = {"student_name": name, "wishes": wishes_str}
+def save_requests_row(name, wishes_str, memo_str):
+    data = {"student_name": name, "wishes": wishes_str, "memo": memo_str}
     supabase.table("requests").upsert(data, on_conflict="student_name").execute()
 
 def load_history():
@@ -155,86 +159,124 @@ def save_students(name_list):
         data = [{"name": n} for n in name_list]
         supabase.table("students").insert(data).execute()
 
+# ★募集スイッチの読み書き
+def get_is_open():
+    try:
+        res = supabase.table("app_settings").select("is_open").eq("id", 1).execute()
+        if res.data: return res.data[0]["is_open"]
+        return True
+    except: return True
+
+def set_is_open(status: bool):
+    supabase.table("app_settings").upsert({"id": 1, "is_open": status}).execute()
+
 # --- 画面構成 ---
 tab1, tab2, tab3 = st.tabs(["🙋 学生用", "📅 先生用 (登録・管理)", "📊 データ集計"])
 
 # ==========================================
-# タブ1: 学生用
+# タブ1: 学生用 (スマホ最適化)
 # ==========================================
 with tab1:
     st.header("レッスン希望の提出")
-    raw_slots = load_slots()
-    student_list = load_students()
     
-    if not raw_slots:
-        st.warning("現在、募集中のレッスン枠はありません。")
-    else:
-        current_slots = sort_slots(raw_slots)
-        df_req = load_requests()
+    # ★募集停止チェック
+    is_open = get_is_open()
+    
+    if not is_open:
+        st.error("⛔ 現在、レッスン希望の受付は停止しています。")
+        st.info("日程調整中、または締め切り後です。先生からの連絡をお待ちください。")
         
-        student_name = ""
-        if not student_list:
-            st.error("名簿が登録されていません。")
-        else:
-            val = st.selectbox("氏名を選択", ["(選択してください)"] + student_list)
-            if val != "(選択してください)": student_name = val
-
-        if student_name:
-            # ★新機能: 自分の確定スケジュール確認
-            st.markdown("---")
-            with st.expander("📅 あなたの確定済みレッスンを確認する"):
+        # 停止中でも「確定した日程」だけは見れるようにする
+        raw_slots = load_slots()
+        student_list = load_students()
+        if student_list:
+            val = st.selectbox("氏名を選択して予定を確認", ["(選択してください)"] + student_list, key="std_check")
+            if val != "(選択してください)":
                 df_h = load_history()
                 if not df_h.empty:
-                    # 今日の日付以降のレッスンを表示
-                    today_str = datetime.now().strftime("%m月%d日") # 簡易比較
-                    my_lessons = df_h[df_h["受講者"] == student_name]
+                    my_lessons = df_h[df_h["受講者"] == val]
                     if not my_lessons.empty:
-                        # 日付順ソート
+                        st.write("##### ✅ あなたの確定レッスン")
                         my_lessons["sort_key"] = my_lessons["日時"].apply(lambda x: sort_slots([x])[0])
                         my_lessons = my_lessons.sort_values("sort_key")
-                        
                         for _, row in my_lessons.iterrows():
-                            st.success(f"✅ {row['日時']}")
-                    else:
-                        st.info("確定したレッスンはまだありません。")
-                else:
-                    st.info("履歴データがありません。")
-
-            st.markdown("---")
-            st.write("### 📝 希望日時の登録")
+                            st.success(f"{row['日時']}")
+                    else: st.info("確定したレッスンはありません。")
+    
+    else:
+        # 募集中
+        raw_slots = load_slots()
+        student_list = load_students()
+        
+        if not raw_slots:
+            st.warning("現在、募集中のレッスン枠はありません。")
+        else:
+            current_slots = sort_slots(raw_slots)
+            df_req = load_requests()
             
-            existing_wishes = []
-            if not df_req.empty and student_name in df_req["氏名"].values:
-                row = df_req[df_req["氏名"] == student_name].iloc[0]
-                if pd.notna(row["希望枠"]) and row["希望枠"]:
-                    existing_wishes = row["希望枠"].split(",")
-            
-            slots_by_date = defaultdict(list)
-            for slot in current_slots:
-                d_key = slot.split(" ")[0]
-                slots_by_date[d_key].append(slot)
+            student_name = ""
+            if not student_list:
+                st.error("名簿が登録されていません。")
+            else:
+                val = st.selectbox("氏名を選択", ["(選択してください)"] + student_list)
+                if val != "(選択してください)": student_name = val
 
-            with st.form("student_form"):
-                final_selected = []
-                for d_key, slots in slots_by_date.items():
-                    with st.expander(f"📅 {d_key}", expanded=True):
-                        all_checked = all(s in existing_wishes for s in slots)
-                        if st.checkbox(f"🙆‍♂️ {d_key} は何時でもOK", value=all_checked, key=f"all_{d_key}"):
-                            final_selected.extend(slots)
-                        else:
-                            for slot in slots:
-                                label = slot.replace(d_key, "").strip()
-                                is_on = slot in existing_wishes
-                                if st.checkbox(label, value=is_on, key=f"chk_{slot}"):
-                                    final_selected.append(slot)
-                
+            if student_name:
+                # 確定確認
+                with st.expander("📅 あなたの確定済みレッスンを確認する"):
+                    df_h = load_history()
+                    if not df_h.empty:
+                        my_lessons = df_h[df_h["受講者"] == student_name]
+                        if not my_lessons.empty:
+                            my_lessons["sort_key"] = my_lessons["日時"].apply(lambda x: sort_slots([x])[0])
+                            my_lessons = my_lessons.sort_values("sort_key")
+                            for _, row in my_lessons.iterrows():
+                                st.success(f"✅ {row['日時']}")
+                        else: st.info("まだありません。")
+
                 st.markdown("---")
-                if st.form_submit_button("希望を送信する", type="primary"):
-                    final_selected = sorted(list(set(final_selected)), key=lambda s: current_slots.index(s) if s in current_slots else 999)
-                    wishes_str = ",".join(final_selected)
-                    save_requests_row(student_name, wishes_str)
-                    st.success("✅ 保存しました！")
-                    st.rerun()
+                
+                # 既存データ読み込み
+                existing_wishes = []
+                existing_memo = ""
+                if not df_req.empty and student_name in df_req["氏名"].values:
+                    row = df_req[df_req["氏名"] == student_name].iloc[0]
+                    if pd.notna(row["希望枠"]) and row["希望枠"]:
+                        existing_wishes = row["希望枠"].split(",")
+                    if "メモ" in row and pd.notna(row["メモ"]):
+                        existing_memo = row["メモ"]
+                
+                slots_by_date = defaultdict(list)
+                for slot in current_slots:
+                    d_key = slot.split(" ")[0]
+                    slots_by_date[d_key].append(slot)
+
+                with st.form("student_form"):
+                    st.write("### 1. 希望日時を選択")
+                    final_selected = []
+                    for d_key, slots in slots_by_date.items():
+                        with st.expander(f"📅 {d_key}", expanded=True):
+                            all_checked = all(s in existing_wishes for s in slots)
+                            if st.checkbox(f"🙆‍♂️ {d_key} は何時でもOK", value=all_checked, key=f"all_{d_key}"):
+                                final_selected.extend(slots)
+                            else:
+                                for slot in slots:
+                                    label = slot.replace(d_key, "").strip()
+                                    is_on = slot in existing_wishes
+                                    if st.checkbox(label, value=is_on, key=f"chk_{slot}"):
+                                        final_selected.append(slot)
+                    
+                    st.write("### 2. 備考 (任意)")
+                    # ★新機能: メモ欄
+                    memo_input = st.text_area("練習したい曲や、先生へのメッセージがあれば記入してください", value=existing_memo, height=100)
+                    
+                    st.markdown("---")
+                    if st.form_submit_button("希望を送信する", type="primary"):
+                        final_selected = sorted(list(set(final_selected)), key=lambda s: current_slots.index(s) if s in current_slots else 999)
+                        wishes_str = ",".join(final_selected)
+                        save_requests_row(student_name, wishes_str, memo_input)
+                        st.success("✅ 保存しました！")
+                        st.rerun()
 
 # ==========================================
 # タブ2: 先生用
@@ -242,6 +284,26 @@ with tab1:
 with tab2:
     st.header("管理者メニュー")
     
+    # ★新機能: 募集スイッチ
+    st.subheader("📢 募集ステータス")
+    is_open = get_is_open()
+    c_sw1, c_sw2 = st.columns([1, 3])
+    with c_sw1:
+        if is_open:
+            st.success("🟢 現在：募集中")
+            if st.button("⛔ 募集を停止する"):
+                set_is_open(False)
+                st.rerun()
+        else:
+            st.error("🔴 現在：停止中")
+            if st.button("🟢 募集を開始する"):
+                set_is_open(True)
+                st.rerun()
+    with c_sw2:
+        st.caption("「停止中」にすると、学生は希望を送信できなくなります（日程調整中などに使います）。")
+
+    st.markdown("---")
+
     with st.expander("📊 半期ごとのレッスン回数", expanded=False):
         df_h = load_history()
         if not df_h.empty:
@@ -257,8 +319,7 @@ with tab2:
         summary = group_continuous_slots(current_slots)
         for s in summary:
             st.info(f"**{s}**")
-            
-        with st.expander("詳細リストの編集・削除はこちら"):
+        with st.expander("詳細リストの編集・削除"):
             for slot in current_slots:
                 col_txt, col_del = st.columns([4, 1])
                 col_txt.text(f"･ {slot}")
@@ -353,8 +414,14 @@ with tab2:
         if df_req.empty or not current_slots: st.error("データ不足")
         else:
             req_map = {}
+            # メモも取得
+            memo_map = {}
             for _, r in df_req.iterrows():
-                if pd.notna(r["希望枠"]) and r["希望枠"]: req_map[r["氏名"]] = r["希望枠"].split(",")
+                if pd.notna(r["希望枠"]) and r["希望枠"]:
+                    req_map[r["氏名"]] = r["希望枠"].split(",")
+                if "メモ" in r and pd.notna(r["メモ"]):
+                    memo_map[r["氏名"]] = r["メモ"]
+
             slot_applicants = {s: [] for s in current_slots}
             for name, wishes in req_map.items():
                 for w in wishes:
@@ -399,22 +466,34 @@ with tab2:
             
             res = []
             for s in sort_slots(current_slots):
-                res.append({"日時": s, "受講者": final_schedule.get(s, "❌"), "学期": get_semester(s)})
+                winner = final_schedule.get(s, "❌")
+                # メモがある場合は表示
+                memo_txt = ""
+                if winner != "❌" and winner in memo_map and memo_map[winner]:
+                    memo_txt = f" ({memo_map[winner]})"
+                    
+                res.append({"日時": s, "受講者": winner + memo_txt, "学期": get_semester(s)})
+                
             st.session_state["preview"] = pd.DataFrame(res)
             st.table(st.session_state["preview"])
             
-            # ★新機能: LINE貼り付け用テキスト生成
             if not st.session_state["preview"].empty:
                 st.write("#### 📋 LINE貼り付け用テキスト")
                 copy_text = "【レッスン日程】\n"
                 for _, row in st.session_state["preview"].iterrows():
-                    if row["受講者"] and "❌" not in row["受講者"]:
+                    # ❌以外を表示
+                    if "❌" not in row["受講者"]:
                         copy_text += f"{row['日時']} : {row['受講者']}\n"
                 st.code(copy_text, language="text")
 
     if "preview" in st.session_state:
         if st.button("確定して履歴に保存"):
-            to_save = st.session_state["preview"][ st.session_state["preview"]["受講者"].str.contains("❌") == False ]
+            # 履歴保存時はメモを除去して名前だけにする
+            to_save = st.session_state["preview"].copy()
+            # "松村泰佑 (曲名)" -> "松村泰佑" に戻す処理
+            to_save["受講者"] = to_save["受講者"].apply(lambda x: x.split(" (")[0])
+            
+            to_save = to_save[ to_save["受講者"].str.contains("❌") == False ]
             save_history_new(to_save)
             st.success("保存完了！")
             del st.session_state["preview"]
@@ -422,16 +501,13 @@ with tab2:
     st.markdown("---")
     st.write("#### 🗑️ データの初期化")
     c_res1, c_res2 = st.columns(2)
-    
-    # ★新機能: 希望リセットボタン
     with c_res1:
         with st.expander("⚠️ 学生の「希望」を全てリセット"):
-            st.warning("来月の日程調整を始める前に押してください。全ての学生の希望データが消えます。")
+            st.warning("来月の日程調整を始める前に押してください。")
             if st.button("希望データを削除", type="primary"):
                 supabase.table("requests").delete().neq("id", 0).execute()
                 st.success("リセットしました")
                 st.rerun()
-
     with c_res2:
         with st.expander("⚠️ レッスン履歴を全てリセット"):
             st.warning("半期が変わる時だけ使ってください。")
