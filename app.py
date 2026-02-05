@@ -9,7 +9,7 @@ from supabase import create_client, Client
 
 # --- 設定 ---
 st.set_page_config(page_title="レッスン調整システム", page_icon="🎹", layout="wide")
-st.title("🎹 レッスン日程 自動調整システム v18")
+st.title("🎹 レッスン日程 自動調整システム v19 (スマホ最適化版)")
 
 # --- Supabase接続 ---
 try:
@@ -67,7 +67,6 @@ def get_semester(date_str):
 def sort_slots(slot_list):
     def parse_key(s):
         try:
-            # 日付と時間を数値化してソートキーにする
             match = re.search(r'(\d{1,2})月(\d{1,2})日.*?(\d{1,2}):(\d{2})', s)
             if match:
                 mo, d, h, m = map(int, match.groups())
@@ -77,60 +76,36 @@ def sort_slots(slot_list):
     return sorted(slot_list, key=parse_key)
 
 def group_continuous_slots(sorted_slots):
-    """
-    連続した枠をまとめて表示するための関数
-    例: 10:00-10:50, 10:50-11:40 -> "10:00〜11:40 (2枠)"
-    """
     if not sorted_slots: return []
-    
-    # 日付ごとに分ける
     grouped_by_date = defaultdict(list)
     for s in sorted_slots:
         d_part = s.split(" ")[0]
         t_part = s.split(" ")[1] if " " in s else ""
         grouped_by_date[d_part].append(t_part)
-        
     summary_list = []
-    
     for date_key, times in grouped_by_date.items():
-        # 時間順にソート済み前提
         if not times: continue
-        
-        current_start = None
-        current_end = None
+        current_start, current_end = None, None
         count = 0
-        
-        # タイムパース用ヘルパー
         def parse_range(t_str):
-            try:
-                s, e = t_str.split("-")
-                return s, e
+            try: return t_str.split("-")
             except: return None, None
-
         for t in times:
             s, e = parse_range(t)
             if not s: continue 
-            
             if current_start is None:
-                current_start = s
-                current_end = e
+                current_start, current_end = s, e
                 count = 1
             else:
-                # 連続チェック (前の終了 == 今の開始)
                 if current_end == s:
                     current_end = e
                     count += 1
                 else:
-                    # 途切れたら保存
                     summary_list.append(f"{date_key} {current_start}〜{current_end} ({count}枠)")
-                    current_start = s
-                    current_end = e
+                    current_start, current_end = s, e
                     count = 1
-        
-        # 最後の一つを保存
         if current_start:
             summary_list.append(f"{date_key} {current_start}〜{current_end} ({count}枠)")
-            
     return summary_list
 
 # --- DB操作 (Supabase) ---
@@ -142,7 +117,6 @@ def load_slots():
 def save_slots(slot_list):
     normalized_list = [normalize_date_text(s) for s in slot_list]
     unique_list = sorted(list(set(normalized_list)), key=lambda s: sort_slots([s])[0])
-    
     supabase.table("slots").delete().neq("id", 0).execute() 
     if unique_list:
         data = [{"date_text": s} for s in unique_list]
@@ -190,7 +164,7 @@ def save_students(name_list):
 tab1, tab2, tab3 = st.tabs(["🙋 学生用", "📅 先生用 (登録・管理)", "📊 データ集計"])
 
 # ==========================================
-# タブ1: 学生用
+# タブ1: 学生用 (スマホ最適化)
 # ==========================================
 with tab1:
     st.header("レッスン希望の提出")
@@ -200,7 +174,6 @@ with tab1:
     if not raw_slots:
         st.warning("現在、募集中のレッスン枠はありません。")
     else:
-        # ★ここでしっかりソート
         current_slots = sort_slots(raw_slots)
         df_req = load_requests()
         
@@ -220,7 +193,6 @@ with tab1:
             
             st.info(f"ログイン中: **{student_name}** さん")
             
-            # 日付ごとにグループ化 (ソート済みのスロットを使うので順番は保たれる)
             slots_by_date = defaultdict(list)
             for slot in current_slots:
                 d_key = slot.split(" ")[0]
@@ -230,16 +202,17 @@ with tab1:
                 final_selected = []
                 for d_key, slots in slots_by_date.items():
                     with st.expander(f"📅 {d_key}", expanded=True):
-                        # 全選択チェック
+                        # 全選択
                         all_checked = all(s in existing_wishes for s in slots)
                         if st.checkbox(f"🙆‍♂️ {d_key} は何時でもOK", value=all_checked, key=f"all_{d_key}"):
                             final_selected.extend(slots)
                         else:
-                            cols = st.columns(2)
-                            for i, slot in enumerate(slots):
+                            # ★変更点: 2列(columns)をやめて、縦一列に配置
+                            for slot in slots:
                                 label = slot.replace(d_key, "").strip()
                                 is_on = slot in existing_wishes
-                                if cols[i % 2].checkbox(label, value=is_on, key=f"chk_{slot}"):
+                                # そのままcheckboxを配置することで縦積みになる
+                                if st.checkbox(label, value=is_on, key=f"chk_{slot}"):
                                     final_selected.append(slot)
                 
                 st.markdown("---")
@@ -270,10 +243,7 @@ with tab2:
     current_slots = sort_slots(load_slots())
     
     if current_slots:
-        # 要約を作成
         summary = group_continuous_slots(current_slots)
-        
-        # 見やすいカード表示
         for s in summary:
             st.info(f"**{s}**")
             
@@ -353,7 +323,7 @@ with tab2:
     
     with st.expander("【方法B】リストを直接編集 (開始時間だけでOK！)"):
         st.info("💡 「9/11 10:00」と書けば、自動で「9月11日(木) 10:00-10:50」になります。")
-        current_slots_text = "\n".join(load_slots()) # 生データをロード
+        current_slots_text = "\n".join(load_slots())
         edited_text = st.text_area("編集エリア", value=current_slots_text, height=200)
         if st.button("この内容で上書き保存する", type="primary"):
             lines = [l.strip() for l in edited_text.split('\n') if l.strip()]
@@ -369,7 +339,7 @@ with tab2:
             save_students([x.strip() for x in txt.split('\n') if x.strip()])
             st.success("保存しました"); st.rerun()
 
-    if st.button("🤖 シフト作成"):
+    if st.button("🤖 シフト作成 (分散優先)"):
         current_slots = load_slots()
         df_req = load_requests()
         df_hist = load_history()
@@ -383,10 +353,45 @@ with tab2:
             for name, wishes in req_map.items():
                 for w in wishes:
                     if w in current_slots: slot_applicants[w].append(name)
+            
             final_schedule = {}
-            for slot in sort_slots(current_slots):
+            current_batch_counts = defaultdict(int)
+            daily_counts = defaultdict(lambda: defaultdict(int))
+            sorted_slots_process = sort_slots(current_slots)
+
+            for slot in sorted_slots_process:
                 cands = slot_applicants[slot]
-                if cands: final_schedule[slot] = random.choice(cands)
+                if not cands: continue
+
+                semester = get_semester(slot)
+                if "(" in slot: date_part = slot.split("(")[0]
+                else: date_part = slot.split(" ")[0]
+
+                scored_cands = []
+                for student in cands:
+                    # 1日2枠上限 (絶対)
+                    if daily_counts[student][date_part] >= 2: continue
+                    
+                    # 過去の回数を取得
+                    past_count = len(df_hist[ (df_hist["受講者"]==student) & (df_hist["学期"]==semester) ])
+                    total_count = past_count + current_batch_counts[student]
+                    
+                    # ★変更点: 2枠目ペナルティ (分散優先)
+                    penalty = 0
+                    if daily_counts[student][date_part] == 1:
+                        # すでに今日1枠持っている場合、スコアを悪くする(数値を増やす)
+                        penalty = 5 
+                    
+                    score = total_count + penalty
+                    scored_cands.append( (score, random.random(), student) )
+                
+                if scored_cands:
+                    scored_cands.sort()
+                    winner = scored_cands[0][2]
+                    final_schedule[slot] = winner
+                    current_batch_counts[winner] += 1
+                    daily_counts[winner][date_part] += 1
+            
             res = []
             for s in sort_slots(current_slots):
                 res.append({"日時": s, "受講者": final_schedule.get(s, "❌"), "学期": get_semester(s)})
