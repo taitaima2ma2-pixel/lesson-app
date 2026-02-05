@@ -9,7 +9,7 @@ from supabase import create_client, Client
 
 # --- 設定 ---
 st.set_page_config(page_title="レッスン調整システム", page_icon="🎹", layout="wide")
-st.title("🎹 レッスン日程 自動調整システム v21")
+st.title("🎹 レッスン日程 自動調整システム v22")
 
 # --- Supabase接続 ---
 try:
@@ -26,22 +26,18 @@ def normalize_date_text(text):
     text = unicodedata.normalize('NFKC', text)
     date_match = re.search(r'(\d{1,2})[\/\-月\.](\d{1,2})', text)
     if not date_match: return text
-        
     month, day = int(date_match.group(1)), int(date_match.group(2))
     now = datetime.now()
     year = now.year
     try: dt = datetime(year, month, day)
     except: return text
-    
     weekdays = ["月", "火", "水", "木", "金", "土", "日"]
     wk = weekdays[dt.weekday()]
     date_str = f"{month}月{day}日({wk})"
-    
     time_match = re.search(r'(\d{1,2}[:：]\d{2})', text)
     if time_match:
         start_time_str = time_match.group(1).replace("：", ":")
         range_match = re.search(r'(\d{1,2}[:：]\d{2})\s*[\-~〜]\s*(\d{1,2}[:：]\d{2})', text)
-        
         if range_match:
             s_t = range_match.group(1).replace("：", ":")
             e_t = range_match.group(2).replace("：", ":")
@@ -54,7 +50,6 @@ def normalize_date_text(text):
                 return f"{date_str} {start_time_str}-{end_time_str}"
             except:
                 return f"{date_str} {start_time_str}"
-    
     return date_str
 
 def get_semester(date_str):
@@ -164,7 +159,7 @@ def save_students(name_list):
 tab1, tab2, tab3 = st.tabs(["🙋 学生用", "📅 先生用 (登録・管理)", "📊 データ集計"])
 
 # ==========================================
-# タブ1: 学生用 (スマホ最適化)
+# タブ1: 学生用
 # ==========================================
 with tab1:
     st.header("レッスン希望の提出")
@@ -185,13 +180,34 @@ with tab1:
             if val != "(選択してください)": student_name = val
 
         if student_name:
+            # ★新機能: 自分の確定スケジュール確認
+            st.markdown("---")
+            with st.expander("📅 あなたの確定済みレッスンを確認する"):
+                df_h = load_history()
+                if not df_h.empty:
+                    # 今日の日付以降のレッスンを表示
+                    today_str = datetime.now().strftime("%m月%d日") # 簡易比較
+                    my_lessons = df_h[df_h["受講者"] == student_name]
+                    if not my_lessons.empty:
+                        # 日付順ソート
+                        my_lessons["sort_key"] = my_lessons["日時"].apply(lambda x: sort_slots([x])[0])
+                        my_lessons = my_lessons.sort_values("sort_key")
+                        
+                        for _, row in my_lessons.iterrows():
+                            st.success(f"✅ {row['日時']}")
+                    else:
+                        st.info("確定したレッスンはまだありません。")
+                else:
+                    st.info("履歴データがありません。")
+
+            st.markdown("---")
+            st.write("### 📝 希望日時の登録")
+            
             existing_wishes = []
             if not df_req.empty and student_name in df_req["氏名"].values:
                 row = df_req[df_req["氏名"] == student_name].iloc[0]
                 if pd.notna(row["希望枠"]) and row["希望枠"]:
                     existing_wishes = row["希望枠"].split(",")
-            
-            st.info(f"ログイン中: **{student_name}** さん")
             
             slots_by_date = defaultdict(list)
             for slot in current_slots:
@@ -234,8 +250,6 @@ with tab2:
         else: st.info("履歴なし")
 
     st.markdown("---")
-    
-    # 登録済みリスト
     st.subheader("📝 登録済みリスト")
     current_slots = sort_slots(load_slots())
     
@@ -268,11 +282,9 @@ with tab2:
             clean_date = normalize_date_text(gen_date).split(" ")[0]
             clean_start = unicodedata.normalize('NFKC', gen_start).replace("：", ":")
             clean_end = unicodedata.normalize('NFKC', gen_end).replace("：", ":")
-            
             dummy = datetime(2000, 1, 1)
             t_s = datetime.strptime(clean_start, "%H:%M")
             t_e = datetime.strptime(clean_end, "%H:%M")
-            
             plan_a = []
             curr = datetime.combine(dummy, t_s.time())
             limit = datetime.combine(dummy, t_e.time())
@@ -280,14 +292,12 @@ with tab2:
                 nxt = curr + timedelta(minutes=50)
                 plan_a.append(f"{clean_date} {curr.strftime('%H:%M')}-{nxt.strftime('%H:%M')}")
                 curr = nxt
-            
             plan_b = []
             curr = datetime.combine(dummy, t_s.time())
             while curr < limit:
                 nxt = curr + timedelta(minutes=50)
                 plan_b.append(f"{clean_date} {curr.strftime('%H:%M')}-{nxt.strftime('%H:%M')}")
                 curr = nxt
-            
             st.session_state["p_a"], st.session_state["p_b"] = plan_a, plan_b
             st.session_state["gen_info"] = f"{clean_date} {clean_start}〜{clean_end}"
         except: st.error("時間を正しく入力してください")
@@ -317,12 +327,11 @@ with tab2:
                 st.rerun()
 
     st.markdown("---")
-    
-    with st.expander("【方法B】リストを直接編集 (開始時間だけでOK！)"):
-        st.info("💡 「9/11 10:00」と書けば、自動で「9月11日(木) 10:00-10:50」になります。")
+    with st.expander("【方法B】リストを直接編集"):
+        st.info("💡 「9/11 10:00」で自動補正されます。")
         current_slots_text = "\n".join(load_slots())
         edited_text = st.text_area("編集エリア", value=current_slots_text, height=200)
-        if st.button("この内容で上書き保存する", type="primary"):
+        if st.button("上書き保存", type="primary"):
             lines = [l.strip() for l in edited_text.split('\n') if l.strip()]
             save_slots(lines)
             st.success("保存しました！")
@@ -393,6 +402,15 @@ with tab2:
                 res.append({"日時": s, "受講者": final_schedule.get(s, "❌"), "学期": get_semester(s)})
             st.session_state["preview"] = pd.DataFrame(res)
             st.table(st.session_state["preview"])
+            
+            # ★新機能: LINE貼り付け用テキスト生成
+            if not st.session_state["preview"].empty:
+                st.write("#### 📋 LINE貼り付け用テキスト")
+                copy_text = "【レッスン日程】\n"
+                for _, row in st.session_state["preview"].iterrows():
+                    if row["受講者"] and "❌" not in row["受講者"]:
+                        copy_text += f"{row['日時']} : {row['受講者']}\n"
+                st.code(copy_text, language="text")
 
     if "preview" in st.session_state:
         if st.button("確定して履歴に保存"):
@@ -401,14 +419,26 @@ with tab2:
             st.success("保存完了！")
             del st.session_state["preview"]
 
-    # ★ここが新機能: 履歴リセットボタン
     st.markdown("---")
-    with st.expander("🗑️ 履歴データの初期化 (レッスン回数リセット)"):
-        st.warning("これまでのレッスン回数や履歴がすべて消えます。半期が変わるタイミングなどで使ってください。")
-        if st.button("履歴を全て削除する", type="primary"):
-            supabase.table("history").delete().neq("id", 0).execute()
-            st.success("履歴をリセットしました！")
-            st.rerun()
+    st.write("#### 🗑️ データの初期化")
+    c_res1, c_res2 = st.columns(2)
+    
+    # ★新機能: 希望リセットボタン
+    with c_res1:
+        with st.expander("⚠️ 学生の「希望」を全てリセット"):
+            st.warning("来月の日程調整を始める前に押してください。全ての学生の希望データが消えます。")
+            if st.button("希望データを削除", type="primary"):
+                supabase.table("requests").delete().neq("id", 0).execute()
+                st.success("リセットしました")
+                st.rerun()
+
+    with c_res2:
+        with st.expander("⚠️ レッスン履歴を全てリセット"):
+            st.warning("半期が変わる時だけ使ってください。")
+            if st.button("履歴を削除", type="primary"):
+                supabase.table("history").delete().neq("id", 0).execute()
+                st.success("リセットしました")
+                st.rerun()
 
 # ==========================================
 # タブ3: 集計
